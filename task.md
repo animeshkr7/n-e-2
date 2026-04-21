@@ -1,0 +1,6 @@
+- `[/]` Create `task.md`
+- `[x]` Create `utils/eu_utils/eu_prompts_v2.py` (LLM prompt for edge cases)
+- `[x]` Create `utils/eu_utils/eu_name_engine_v2_utils.py` (Main pipeline, permutations, ranking)
+- `[x]` Update `utils/eu_pdf_utils/eu_pdf_data_points_extractor_utils.py` (Parallel integration)
+- `[x]` Update `utils/eu_html_utils/eu_data_point_extractor_utils.py` (Parallel integration)
+- `[x]` Create `walkthrough.md`
