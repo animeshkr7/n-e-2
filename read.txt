@@ -1,0 +1,629 @@
+1. Entry Point & Core Services
+index.py: Acts as a router or entry point. It contains logic to identify the list ID and trigger the EU workflow (e.g., logger.info("List ID %s for EU Press Release", list_id)).
+service/base/EUService.py: The base service class that initializes EU-related tasks and manages the RSS feed link for EU press releases.
+2. Processors
+service/processors/eu_processors.py: Contains the core logic for processing EU Press Releases. It manages S3 storage paths specifically for PRs (e.g., source_raw_files/EU-PR/snap/... and source_raw_files/EU-PR/intermediate_pdf/...).
+service/processors/eu_rt_hitl_recon.py: Handles reconciliation tasks and tags entities with the list name "EU-PR".
+3. Data Extraction & Translation
+service/extractor/eu_extractor/eu_html_extractor.py: Contains the code responsible for scraping and extracting data from EU press release HTML pages.
+utils/eu_pdf_utils/eu_pdf_prompts.py: Includes prompts and context strings (mentioning EU regulations) used to parse and extract information from EU press release PDFs.
+service/translator/eu_translator/eu_translator.py: Responsible for transforming the extracted raw data into a structured format, explicitly mapping the listName as "EU-PR".
+4. Utilities and Database Helpers
+utils/eu_utils/eu_common_utils.py: Contains helper functions for managing the state of a PR (e.g., update_pr(pr) updates timestamps and statuses like "PR_ENTITY_EXTRACTED").
+utils/mongo_utils/mongo_utils.py: Has database interaction functions to check if an EU PR should proceed with extraction and to update its status or handle exceptions.
+5. Notifications (Emails)
+service/success_email/success_email_service.py: Sends automated success alerts when new press releases for the EU list are officially announced.
+service/error_email/error_email_service.py: Sends error notifications if there are failures in extracting or parsing an EU Press Release.
+In summary, this codebase fully supports an automated pipeline to detect, extract (from HTML/PDF), process, and notify users about EU Press Releases.
+
+
+==========================
+
+Yes, there are several LLM calls specifically dedicated to processing, extracting, and cleaning names and name aliases from the Press Releases.
+
+Here is a breakdown of how the LLM is used for name processing:
+
+1. Generating Name Aliases and Variations
+In utils/eu_utils/eu_name_aliases_utils.py and utils/eu_utils/eu_prompts.py, the LLM is heavily used to parse complex names into structured formats:
+
+name_alias_for_individuals_prompt: The LLM is instructed: "You are a language expert with domain expertise in names. Given the name-related information, your task is to generate a dictionary capturing all possible variations of the first, middle, last, and whole names..."
+name_alias_for_entities_prompt: Used specifically for extracting and generating alias variations for company or organization names.
+primary_name_entities: A prompt used to identify the main/primary name of an entity when multiple variations or aliases are present in the text.
+2. Name Cleaning and Splitting (Pure/Impure Names)
+In utils/eu_utils/eu_name_aliases_utils.py, the code makes sequential LLM calls to clean up messy name strings:
+
+pure_impure_prompt: The LLM evaluates if a name is "pure" (just the name) or "impure" (contains titles, ranks, or other non-name text) using llm_call_and_parse_json_dict_response.
+Part Splitting: For complex strings, the LLM splits the text into constituent parts (e.g., separating the actual name from titles like "General" or "Director") and appends the results to first, middle, last, and whole name arrays.
+3. Contextual Entity Extraction
+In utils/eu_pdf_utils/eu_pdf_data_points_extractor_utils.py, when extracting structured data points from the raw PDF text, the LLM is given context about the "Last Entity" processed.
+
+The code passes *Last Entity*: {last_entity.get("name", "")} into the LLM prompt. This ensures that the LLM understands which person or company the current chunk of text refers to, preventing data from being attributed to the wrong name.
+Technologies Used
+The application uses LangChain (ChatOpenAI) and OpenAI's SDK (pydantic_llm_instance) to execute these LLM calls.
+It often enforces structured outputs using LangChain's Pydantic parsers to ensure the extracted names and aliases are returned as strict JSON objects/dictionaries.
+7:26 AM
+
+
+
+=======================================================================
+
+
+Based on the codebase and our previous findings, the phrase "name engine" doesn't literally appear as a class or folder name in the code. However, conceptually, the "name engine" refers to the highly orchestrated pipeline of LLM calls housed primarily within utils/eu_utils/eu_name_aliases_utils.py and powered by utils/eu_utils/eu_prompts.py.
+
+This system acts as an "engine" because it takes raw, messy name strings from press releases and puts them through a multi-step assembly line of LLM processing to output clean, structured data.
+
+Here is what the "Name Engine" consists of in this codebase:
+
+The Classifier (pure_impure_prompt): It first acts as a filter, taking a raw string and determining if it's a "pure" name (just first/last name) or an "impure" name (cluttered with titles, ranks, or locations).
+
+The Part Splitter (part_split_call): For impure names or complex strings, it acts like a parsing engine, breaking the string down into precise constituent parts (e.g., separating "General" from "John Doe" or separating Russian patronymics).
+
+The Alias Generator (name_alias_for_individuals_prompt & name_alias_for_entities_prompt): This is the core of the engine. It takes the cleaned name parts and algorithmically generates a comprehensive dictionary of all possible name aliases (first, middle, last, and whole name combinations).
+
+The Primary Extractor (primary_name_entities): When multiple names or organizations are tangled together, this part of the engine identifies which is the primary subject.
+
+In short, eu_name_aliases_utils.py is the "Name Engine". It acts as the central brain that orchestrates these sequential LangChain/OpenAI calls to transform unstructured, messy text into highly structured, alias-rich entity profiles.
+
+===============================================
+
+from pydantic import BaseModel, Field
+from langchain_core.output_parsers import JsonOutputParser
+
+class EdgeCaseNameResult(BaseModel):
+    is_edge_case: bool = Field(description="True if the name contains extreme edge cases like multiple languages mixed, mononyms, or severe formatting issues.")
+    cleaned_names: list[str] = Field(description="List of cleaned and standardized names extracted from the edge case input.")
+
+def edge_case_name_call():
+    system_prompt = """
+    You are an expert at analyzing and resolving complex and edge-case name structures from press releases.
+    Your task is to identify if the given name string contains extreme edge cases (e.g., dual language combinations like 'John Doe (Иван Доев)', 
+    mononyms, excessive or malformed punctuation, or titles embedded directly into the name without separation) and clean it.
+    
+    If it is an edge case, extract all valid, distinct names and return them in a standardized, clean format in the `cleaned_names` array.
+    If it is NOT an edge case, return the original name in the `cleaned_names` array.
+    """
+    parser = JsonOutputParser(pydantic_object=EdgeCaseNameResult)
+    format_instructions = parser.get_format_instructions()
+    return system_prompt, format_instructions, parser
+================================
+
+eu_name_engine_v2_utils:
+
+import itertools
+import difflib
+import concurrent.futures
+from utils.eu_utils.eu_common_utils import get_logger, llm_for_pydantic
+from utils.llm_utils.lang_chain_utils import execute_lang_chain
+from utils.eu_utils.eu_prompts_v2 import edge_case_name_call
+
+logger = get_logger("eu_name_engine_v2")
+
+def detect_and_clean_edge_cases(raw_names):
+    """
+    Passes names through an LLM to identify and resolve complex edge cases.
+    """
+    cleaned = []
+    system_prompt, format_instructions, parser = edge_case_name_call()
+    
+    for name in raw_names:
+        try:
+            response, _ = execute_lang_chain(
+                system_prompt=system_prompt,
+                format_instructions=format_instructions,
+                input_content=f"INPUT NAME: {name}",
+                parser=parser,
+                model=llm_for_pydantic
+            )
+            # Response is a dictionary due to JsonOutputParser mapping to Pydantic
+            if response.get("is_edge_case") and response.get("cleaned_names"):
+                cleaned.extend(response.get("cleaned_names"))
+            else:
+                cleaned.append(name)
+        except Exception as e:
+            logger.error(f"Error in edge case detection for {name}: {e}")
+            cleaned.append(name)
+            
+    return list(set(cleaned))
+
+def generate_permutations(cleaned_names):
+    """
+    Generates permutations and combinations of the name parts.
+    """
+    permutations_set = set()
+    for name in cleaned_names:
+        parts = name.split()
+        if len(parts) <= 1:
+            permutations_set.add(name)
+            continue
+            
+        # Generate permutations of all lengths up to the number of parts
+        for r in range(1, len(parts) + 1):
+            for perm in itertools.permutations(parts, r):
+                permutations_set.add(" ".join(perm))
+                
+    return list(permutations_set)
+
+def search_and_rank_names(permutations, reference_doc):
+    """
+    Searches the generated permutations against a reference doc (list of strings)
+    and returns the top 10 most similar matches using SequenceMatcher.
+    """
+    scored_matches = []
+    
+    for perm in permutations:
+        for ref_name in reference_doc:
+            # Calculate similarity ratio between 0 and 1
+            ratio = difflib.SequenceMatcher(None, perm.lower(), ref_name.lower()).ratio()
+            if ratio > 0.6:  # Threshold to filter out complete mismatches
+                scored_matches.append({
+                    "input_permutation": perm,
+                    "matched_reference": ref_name,
+                    "score": ratio
+                })
+                
+    # Sort by score descending
+    scored_matches.sort(key=lambda x: x["score"], reverse=True)
+    
+    # Deduplicate keeping highest scores
+    seen_refs = set()
+    unique_top_matches = []
+    for match in scored_matches:
+        if match["matched_reference"] not in seen_refs:
+            seen_refs.add(match["matched_reference"])
+            unique_top_matches.append(match)
+            if len(unique_top_matches) >= 10:
+                break
+                
+    return unique_top_matches
+
+def _run_pipeline_sync(raw_names, reference_doc):
+    logger.info(f"Starting Name Engine v2 for names: {raw_names}")
+    
+    # Step 1: LLM Edge Case Detection
+    cleaned_names = detect_and_clean_edge_cases(raw_names)
+    logger.info(f"Cleaned names from edge cases: {cleaned_names}")
+    
+    # Step 2: Generate Permutations
+    permutations = generate_permutations(cleaned_names)
+    logger.info(f"Generated {len(permutations)} permutations.")
+    
+    # Step 3: Search and Rank
+    top_matches = search_and_rank_names(permutations, reference_doc)
+    logger.info(f"Found {len(top_matches)} top matches.")
+    
+    return {
+        "original_names": raw_names,
+        "cleaned_names": cleaned_names,
+        "permutation_count": len(permutations),
+        "top_10_similar_matches": top_matches
+    }
+
+def run_name_engine_v2_pipeline(raw_names, reference_doc):
+    """
+    Entry point to run Name Engine v2 in parallel to the main thread.
+    Returns a concurrent.futures.Future object.
+    """
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_run_pipeline_sync, raw_names, reference_doc)
+    return future
+
+
+=================================================
+
+eu_pdf_data_point_extractor:
+
+from service.logger.logger import get_logger
+
+from utils.eu_utils.eu_pydantic import execute_lang_chain, pydantic_llm_instance
+from utils.eu_pdf_utils.eu_pdf_prompts import extractor_system_prompt, extractor_system_prompt_3_7, Result
+
+from utils.eu_utils.eu_common_utils import max_tokens
+from utils.eu_utils.eu_name_aliases_utils import permute_names, adjust_for_names
+from utils.eu_utils.eu_name_engine_v2_utils import run_name_engine_v2_pipeline
+
+from langchain_core.output_parsers import JsonOutputParser
+import asyncio, re
+logger = get_logger("eu_pdf_data_point_extractor_utils")
+
+
+entry_parser = JsonOutputParser(pydantic_object=Result)
+output_format_records = entry_parser.get_format_instructions()
+validation_method_entries = "Entries"
+
+def get_name_adjusted_records(temp_output_list):
+    try:
+        if not temp_output_list:
+            return []
+        temp_output_list = adjust_for_names(temp_output_list)
+        temp_output_list = permute_names(temp_output_list)
+        
+        try:
+            raw_names = []
+            for item in temp_output_list:
+                if isinstance(item, dict) and "name" in item:
+                    raw_names.append(item.get("name"))
+                elif isinstance(item, dict) and "primary_name" in item:
+                    raw_names.append(item.get("primary_name"))
+            if raw_names:
+                run_name_engine_v2_pipeline(raw_names, [])
+        except Exception as v2_err:
+            logger.error(f"Error triggering Name Engine V2: {v2_err}")
+            
+        logger.info(f"Total number of entries in this content: {len(temp_output_list)}")
+        return temp_output_list              
+    except Exception as e:
+        logger.error(f"Error occurred while get_name_adjusted_records: {e} for input {temp_output_list}")
+        return []
+    
+def extract_complete_records(output_message,costs): #todo name change
+    extract_content_again = True
+    list_of_records_in_content = []
+    try:
+        if costs.completion_tokens < max_tokens:
+            logger.info("LLM has stoped gracefully")
+            list_of_records_in_content.extend(get_name_adjusted_records(output_message.get("result",[])))
+            extract_content_again = False
+        else:
+            logger.info("LLM has stoped unexpectedly")
+            logger.info(output_message)
+            list_of_records_in_content.extend(get_name_adjusted_records(output_message.get("result",[])[:-1]))
+        return list_of_records_in_content, extract_content_again
+    except Exception as E:
+        logger.error(f"Error occurred while extract_complete_records: {E}, costs: {costs}, llm_response: {output_message}")
+
+def modify_llm_output(output_message):
+    for entry in output_message.get("result"):
+        entry["name_info"] = re.sub(r'(\\n|\n)', ' ', entry["name_info"])
+    return output_message
+
+def process_content(input_content_for_LLM_call):
+    list_of_records_in_content= []
+    should_extract_content = True
+    try:
+        while(should_extract_content == True):
+            last_entity = list_of_records_in_content[-1] if list_of_records_in_content else ""
+            prompt_for_call = extractor_system_prompt if not last_entity else extractor_system_prompt_3_7
+            input_for_call = f"*Input*: {input_content_for_LLM_call}" if not last_entity else f"""*Input*: {input_content_for_LLM_call}\n*Last Entity*: {last_entity.get("name", "")}"""
+
+            output_message,costs = execute_lang_chain(system_prompt=prompt_for_call, 
+                                                    format_instructions=output_format_records,
+                                                    input_content=input_for_call, 
+                                                    parser=entry_parser,
+                                                    model=pydantic_llm_instance,
+                                                    validation_method=validation_method_entries
+                                                    )
+            logger.info(f"LLM output: {output_message}, costs: {costs}")
+            output_message = modify_llm_output(output_message)
+            records_extracted, should_extract_content = extract_complete_records(output_message, costs)
+            list_of_records_in_content.extend(records_extracted)
+    except Exception as E:
+        logger.error(f"Error in process_content for content: {input_content_for_LLM_call} as error: {E}")
+    
+    if isinstance(input_content_for_LLM_call, list):
+        for item in list_of_records_in_content:
+            item["completeInformation"] = str(input_content_for_LLM_call)    
+    
+    return list_of_records_in_content
+
+async def parallelized_processing(contents):
+    logger.info("Parallel Extraction of Records has begun")
+    individuals_data_full = []
+    # Use asyncio.to_thread to run blocking tasks in parallel
+    tasks = [asyncio.to_thread(process_content, content) for content in contents]
+    
+    # Gather results concurrently
+    results = await asyncio.gather(*tasks)
+    
+    # Collect all individual results
+    for individuals_data in results:
+        individuals_data_full.extend(individuals_data)
+
+    final_output_list = individuals_data_full
+    return final_output_list
+
+========================================================
+
+eu not pdf data point extractor:
+
+from service.logger.logger import get_logger
+from service.exception.exception import ExtractorException
+
+from utils.eu_html_utils.eu_url_parser_utils import get_html_text_oj_tables_seperate, copy_html_soup, remove_the_header_row_from_a_bs_row
+from utils.eu_html_utils.eu_html_common_utils import check_duplicate_names
+
+from utils.eu_html_utils.eu_html_prompts import data_point_extractor_system_prompt_1, data_points_extractor, extractor_system_prompt_3_7
+from utils.eu_utils.eu_name_aliases_utils import adjust_for_names, permute_names
+from utils.eu_utils.eu_name_engine_v2_utils import run_name_engine_v2_pipeline
+from utils.eu_utils.eu_common_utils import retry_llm_calls_with_constant_delay, get_messages, get_stop_reason_from_llm_response, get_text_from_llm_response,LLMFault
+
+import json
+import asyncio
+logger = get_logger("eu_data_point_extractor_utils")
+
+async def perform_data_point_extraction(fullcontenthtml,i):
+    try:
+        contents, _, image_links= get_html_text_oj_tables_seperate(fullcontenthtml) #html is passed to tables
+        final_output_list = await parallelized_processing(contents)
+        return final_output_list, i, image_links
+    except Exception as E:
+        raise ExtractorException(f"Error in perform_data_point_extraction: {E}")
+
+async def parallelized_processing(contents):
+    individuals_data_full = []
+    
+    # Use asyncio.to_thread to run blocking tasks in parallel
+    tasks = [asyncio.to_thread(process_content, content) for content in contents]
+    
+    # Gather results concurrently
+    results = await asyncio.gather(*tasks)
+    
+    # Collect all individual results
+    for individuals_data in results:
+        individuals_data_full.extend(individuals_data)
+
+    final_output_list = individuals_data_full
+    return final_output_list
+
+def process_content(content_as_dictionary):
+    data_present_in_content = []
+    num_of_llm_calls_made_in_content = 0
+    try:
+        # This is the synchronous code that handles each individual content
+        if not isinstance(content_as_dictionary, dict):
+            raise ExtractorException("content is not a dictionary")
+        is_row = False
+        for key, value in content_as_dictionary.items():
+            if key == "row":
+                is_row = True
+            input_content_for_LLM_call = value
+        output_message = get_first_call_output(input_content_for_LLM_call)
+        data_present_in_content, num_of_llm_calls_made_in_content = check_for_overflowing_context_limit(
+                                                                            data_present_in_content, 
+                                                                            input_content_for_LLM_call, 
+                                                                            num_of_llm_calls_made_in_content, 
+                                                                            output_message
+                                                                            )
+        data_present_in_content = modify_additional_info_incase_of_rows(is_row,data_present_in_content, input_content_for_LLM_call)
+    except Exception as E:
+        logger.error(f"Error in process_content for content: {content_as_dictionary} as error: {E}")
+    return data_present_in_content
+
+def get_first_call_output(content):
+    try:
+        response_extractor_first_call = retry_llm_calls_with_constant_delay(get_messages(
+                                                                                f"content: {content}",
+                                                                                f"""{data_point_extractor_system_prompt_1}\n\nData Points: {data_points_extractor}"""
+                                                                                    )
+                                                                            )
+        return response_extractor_first_call 
+    except Exception as E:
+        raise ExtractorException(f"error in get_first_call_output: {E}")
+
+def modify_additional_info_incase_of_rows(is_row,data_present_in_content, input_content_for_LLM_call):
+    try:
+        if not is_row:
+            return data_present_in_content
+        for entry in data_present_in_content:
+            try:
+                if not isinstance(entry, dict):  # Ensure it's a dictionary before updating
+                    logger.error(f"{entry} is not a dictionary")
+                else:
+                    content_as_soup = copy_html_soup(input_content_for_LLM_call)
+                    header_removed_row_as_soup = remove_the_header_row_from_a_bs_row(content_as_soup)
+                    replaced_row = header_removed_row_as_soup.get_text(strip=True, separator=" ")
+                    entry["completeInformation"] = replaced_row
+            except Exception as E:
+                logger.error(f"Error in modify_additional_info_incase_of_rows for entry: {entry}, error: {E}")
+    except Exception as E:
+        logger.error(f"Error in modify_additional_info_incase_of_rows error: {E}")
+    return data_present_in_content
+
+def get_content_extractor_first_call(webpage_content, data_points_extractor):
+    return (
+        f"content: {webpage_content}\n\n"
+        f"Data Points: {data_points_extractor}"
+        )
+
+def check_for_overflowing_context_limit(individuals_data, content, i, output_message):
+    intermediate_op_list_flag = "in_progress"
+    output_list = []
+    try:
+        while intermediate_op_list_flag == "in_progress":
+            last_entity,intermediate_op_list, intermediate_op_list_flag = curate_intermediate_output_list( 
+                                                                                                    output_message, 
+                                                                                                    output_list
+                                                                                                    )
+            if intermediate_op_list_flag == "completed" and intermediate_op_list is not None:
+                logger.info("Extraction is completed!!")
+                output_list = intermediate_op_list
+            elif intermediate_op_list_flag == "in_progress" and intermediate_op_list is not None:
+                logger.info("Making an LLM call with restructured prompt!!")
+                i += 1
+                response_extractor_subsequent_calls = get_subsequent_calls_output(content, last_entity)
+                output_message = response_extractor_subsequent_calls
+                output_list = intermediate_op_list
+
+            if check_duplicate_names(output_list):
+                raise LLMFault("There are duplicates in this LLM call list ask the analyst to verify crucial","duplication")
+            # - if duplicate_extraction observed - raise an exception anda notif for a manual run
+            # - set a hard limit on number of calls allowed, based on the tokens (check the backtested o/p tokens)
+        
+        logger.info(f"Number of LLM calls made uptill this annex/content: {i}")
+        individuals_data.extend(output_list)
+        if check_duplicate_names(individuals_data):
+            logger.info("There are duplicates in list for all annex contents ask the analyst to verify")
+        return individuals_data, i
+    except Exception as E:
+        raise ExtractorException(f"Error in check for overflowing context limit: {E}")
+
+def curate_intermediate_output_list(chat_completions, output_list):
+    """
+        inputs: LLM output, output list
+        output: lastentity, Updated output list, completion_flag
+    """
+    stop_reason = get_stop_reason_from_llm_response(chat_completions)
+    text_content = get_text_from_llm_response(chat_completions)
+
+    logger.info(f"Output text string is: \n{text_content}")
+    logger.info(f"Output stop_reason is: {stop_reason}")
+
+    if stop_reason == 'length':
+        logger.info("Notify analyst to verify this output as an additional layer of safety.")
+        last_entity, updated_intermediate_output_list = update_intermediate_output_list_with_new_entries(output_list, text_content)
+        if last_entity is None: #The output stoped due to context limit but there is no last entity
+            logger.info("The output stoped due to context limit but output list could not be updated")
+            return None, updated_intermediate_output_list, "completed"
+        return last_entity,updated_intermediate_output_list, "in_progress"
+    
+    elif stop_reason == 'stop':
+        logger.info("LLM terminated gracefully")
+        try:
+            temp_output_list = json.loads(text_content)
+            temp_output_list = temp_output_list.get("result")
+            if temp_output_list is None:
+                raise ValueError("The 'result' key is missing in the JSON content.")
+            temp_output_list = adjust_for_names(temp_output_list)
+            temp_output_list = permute_names(temp_output_list)
+            
+            try:
+                raw_names = []
+                for item in temp_output_list:
+                    if isinstance(item, dict) and "name" in item:
+                        raw_names.append(item.get("name"))
+                    elif isinstance(item, dict) and "primary_name" in item:
+                        raw_names.append(item.get("primary_name"))
+                if raw_names:
+                    run_name_engine_v2_pipeline(raw_names, [])
+            except Exception as v2_err:
+                logger.error(f"Error triggering Name Engine V2: {v2_err}")
+                
+            output_list.extend(temp_output_list)
+            return None, output_list, "completed"
+        except Exception as e:
+            logger.error(f"LLM response has stop_reason == 'stop' in curate_intermediate_output_list but still json.loads failed. Error: {e}")
+            return None, output_list, "completed"
+    else:
+        logger.info(f"LLM has stopped due to unknown reason: {stop_reason}")
+        return None, output_list, "completed"
+
+def update_intermediate_output_list_with_new_entries(output_list, json_text_content):
+    try:
+        json_text_content = get_json_parsable_string_from_llm_output(json_text_content)
+        temp_output_list = json.loads(json_text_content)
+        temp_output_list = temp_output_list.get("result")
+        if temp_output_list is None:
+            raise ValueError("The 'result' key is missing in the JSON content.")
+        temp_output_list = adjust_for_names(temp_output_list)
+        temp_output_list = permute_names(temp_output_list)
+        
+        try:
+            raw_names = []
+            for item in temp_output_list:
+                if isinstance(item, dict) and "name" in item:
+                    raw_names.append(item.get("name"))
+                elif isinstance(item, dict) and "primary_name" in item:
+                    raw_names.append(item.get("primary_name"))
+            if raw_names:
+                run_name_engine_v2_pipeline(raw_names, [])
+        except Exception as v2_err:
+            logger.error(f"Error triggering Name Engine V2: {v2_err}")
+            
+        last_entity = temp_output_list[-1]
+        last_entity = last_entity.get("name")
+        logger.info(f"Last entry is:{last_entity}")
+        logger.info(f"Total entries in output_list pre-update: {len(output_list)}")
+        logger.info(f"Total entries in this update: {len(temp_output_list)}")
+
+        output_list.extend(temp_output_list)
+        logger.info(f"Total entries in output_list post-update: {len(output_list)}")
+
+        return last_entity, output_list                
+    except Exception as e:
+        logger.error(f"Error occurred while update_intermediate_output_list_with_new_entries: {e}")
+        return None, output_list  # Return None to indicate an error
+    
+def get_json_parsable_string_from_llm_output(data: str):
+    """ input: string, 
+        output: json parsable string
+    """
+    try:
+        lines = data.strip().split('\n')
+        found_brace = False
+        for i in range(len(lines) - 1, -1, -1):
+            if lines[i].strip() == '},' and 'id_remarks' not in lines[i - 1] and "wholeNameVariations" not in lines[i-1]:
+                found_brace = True
+                break
+
+        if found_brace:
+            output_lines = lines[:i+1]
+            output_string = '\n'.join(output_lines)
+            output_string_ready_for_json_loads = output_string[:-1] + "]}"
+            return output_string_ready_for_json_loads
+        else:
+            raise ExtractorException(f"No ',' found in the data. {data}")
+    except Exception as E:
+        raise ExtractorException(f"Error in getting json parsable string from llm output: {E}input is {data}")
+
+def get_subsequent_calls_output(content, last_entity):
+    try:    
+        response_extractor_subsequent_calls = retry_llm_calls_with_constant_delay(get_messages(
+                                                                                            get_content_extractor_subsequent_calls(
+                                                                                                        content,
+                                                                                                        last_entity
+                                                                                                ),
+                                                                                            f"""{extractor_system_prompt_3_7}\n\ndata_points_extractor: {data_points_extractor}"""
+                                                                                        )
+                                                                                        )
+        return response_extractor_subsequent_calls
+    except Exception as E:
+        raise ExtractorException(f"error in get_subsequent_calls_output: {E}, with last_entity:{last_entity}")
+
+def get_content_extractor_subsequent_calls(webpage_content, previously_extracted_body):
+    return (
+        f"content: {webpage_content}\n\n"
+        f"previously_extracted_body: {previously_extracted_body}"
+    )
+
+=======================================
+
+You do not need to do anything manually to run it! It is fully integrated into the existing workflow and runs automatically. Whenever the system processes a new EU Press Release (both PDFs and HTMLs), Name Engine V2 will automatically fire in the background.
+
+Here are the specific sections I modified to add the integration:
+
+1. EU HTML Extractor
+File Modified: utils/eu_html_utils/eu_data_point_extractor_utils.py
+
+I injected the parallel execution right after the original permute_names finishes processing an intermediate output list. You can see this inside the curate_intermediate_output_list and update_intermediate_output_list_with_new_entries functions (around lines 150-180).
+
+Here is what the injected code looks like:
+
+python
+temp_output_list = adjust_for_names(temp_output_list)
+temp_output_list = permute_names(temp_output_list)
+# --- NEW: Name Engine V2 Hook ---
+try:
+    raw_names = []
+    for item in temp_output_list:
+        if isinstance(item, dict) and "name" in item:
+            raw_names.append(item.get("name"))
+        elif isinstance(item, dict) and "primary_name" in item:
+            raw_names.append(item.get("primary_name"))
+    if raw_names:
+        run_name_engine_v2_pipeline(raw_names, []) # <--- Triggered here
+except Exception as v2_err:
+    logger.error(f"Error triggering Name Engine V2: {v2_err}")
+# --------------------------------
+output_list.extend(temp_output_list)
+2. EU PDF Extractor
+File Modified: utils/eu_pdf_utils/eu_pdf_data_points_extractor_utils.py
+
+I injected the exact same logic into the get_name_adjusted_records function. Right before the function returns temp_output_list, it extracts the names and throws them to the V2 pipeline to be processed concurrently.
+
+How it runs in parallel
+By calling run_name_engine_v2_pipeline(raw_names, []), it triggers a ThreadPoolExecutor inside eu_name_engine_v2_utils.py. This executor takes the task and runs it on a separate background thread.
+
+This means that the original extraction process immediately continues working on the next task without waiting for the V2 LLM calls or ranking algorithms to finish.
+
+Note: Right now, I am passing an empty list [] as the reference document for the similarity search. If you have a specific database or list of historical names you want to compare against, you can pass that list in place of the []!
+
+7:42 AM
